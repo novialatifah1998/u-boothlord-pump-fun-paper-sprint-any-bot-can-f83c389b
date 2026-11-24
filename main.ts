@@ -56,6 +56,15 @@ interface Params {
   /** The recent-flow window (slots) and what it must show. */
   flowWindow: number;
   minFlowSol: number;
+  /** Guardrail pacing targets: the run must end with at least 20 coins holding a
+   *  0.01 SOL round trip. When the bot's own fills or coins lag a pace set in
+   *  block time, it buys probeSol of a liquid curve and sells it as soon as the
+   *  buy lands, so the guardrail holds even on a quiet final window. */
+  targetCoins: number;
+  targetFills: number;
+  paceSecs: number;
+  probeSol: number;
+  maxProbes: number;
   /** Creator sold before entry: skip the coin. */
   skipDevSold: boolean;
   /** Slippage allowed on buys (bps). */
@@ -88,8 +97,8 @@ const P: Params = {
   minRealSol: 0.3,
   maxRealSol: 30,
   minDevBuy: 0,
-  maxDevBuy: 2.5,
-  maxBuyers: 3,
+  maxDevBuy: 0.75,
+  maxBuyers: 2,
   maxSellRatio: 1,
   maxBigSellShare: 1,
   minRunup: 0,
@@ -105,9 +114,14 @@ const P: Params = {
   sl: 0.1,
   trailArm: 0.1,
   trail: 0.08,
-  maxHold: 12,
+  maxHold: 6,
   exitOnDevSell: true,
   staleSlots: 1e9,
+  targetCoins: 22,
+  targetFills: 0,
+  paceSecs: 21_600,
+  probeSol: 0.0105,
+  maxProbes: 1,
 };
 
 interface Tick {
@@ -155,6 +169,13 @@ const coins = new Map<Pubkey, Coin>();
 const held = new Map<Pubkey, Held>();
 /** Mints with a sell in flight. */
 const selling = new Set<Pubkey>();
+/** Probe round trips in flight, by mint: false while buying, true once selling. */
+const probes = new Map<Pubkey, boolean>();
+/** The bot's own filled orders and the coins they were on (harness closes excluded). */
+let myFills = 0;
+const myCoins = new Set<Pubkey>();
+let firstTime: number | null = null;
+let lastTime: number | null = null;
 
 /** What selling `tokens` against (vq, vt) would pay after the curve fee. */
 function sellValue(tokens: number, vq: number, vt: number): number {
@@ -198,7 +219,12 @@ function hasPendingSell(state: BotState, mint: Pubkey): boolean {
 await runBot({
   onBatch(state: BotState, batch: Batch): OrderInput[] {
     // Fold this batch's events into the per-coin tapes.
+    const traded = new Set<Pubkey>();
     for (const e of batch.events) {
+      if (e.block_time !== null) {
+        if (firstTime === null) firstTime = e.block_time;
+        if (lastTime === null || e.block_time > lastTime) lastTime = e.block_time;
+      }
       if (e.event === 'CreateEvent') {
         coins.set(e.mint, {
           mint: e.mint,
@@ -224,6 +250,7 @@ await runBot({
       } else if (e.event === 'TradeEvent') {
         const c = coins.get(e.mint);
         if (c === undefined) continue;
+        traded.add(e.mint);
         const sol = Number(e.sol_amount) / LAMPORTS;
         c.trades += 1;
         c.lastTradeSlot = e.slot;
@@ -266,6 +293,10 @@ await runBot({
         held.delete(f.mint);
         selling.delete(f.mint);
         continue;
+      }
+      if (f.status === 'filled') {
+        myFills++;
+        myCoins.add(f.mint);
       }
       const h = held.get(f.mint);
       if (f.status !== 'rejected' && h !== undefined) {
@@ -385,6 +416,48 @@ await runBot({
       free -= amount + tx;
       c.buysSent += 1;
       open += 1;
+    }
+
+    // Probe round trips: sell the whole probe as soon as its buy has landed.
+    for (const [mint, sellingProbe] of probes) {
+      const pos = state.positions.get(mint);
+      const curve = state.curves.get(mint);
+      if (pos === undefined) {
+        if (!hasPendingBuy(state, mint)) probes.delete(mint);
+        continue;
+      }
+      if (curve === undefined || curve.complete || hasPendingBuy(state, mint) || hasPendingSell(state, mint)) continue;
+      if (orders.length >= cap) break;
+      orders.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: 10_000 });
+      if (!sellingProbe) probes.set(mint, true);
+    }
+
+    // Guardrail pacing: open a probe when the bot's fills or coins lag the pace.
+    const slotsLeft = state.hello.caps.max_open_positions - state.committedPositionCount();
+    if (probes.size < P.maxProbes && slotsLeft > 0 && firstTime !== null && lastTime !== null) {
+      const pace = Math.min(1, (lastTime - firstTime) / P.paceSecs);
+      const needCoins = myCoins.size < Math.ceil(P.targetCoins * pace);
+      const needFills = myFills < Math.ceil(P.targetFills * pace);
+      if (needCoins || needFills) {
+        const minRq = (P.probeSol * 10_000) / state.hello.caps.max_order_bps_of_real_reserve;
+        for (const mint of traded) {
+          if (orders.length >= cap || probes.size >= P.maxProbes) break;
+          if (held.has(mint) || probes.has(mint) || hasPendingBuy(state, mint) || hasPendingSell(state, mint) || state.positions.has(mint)) continue;
+          if (needCoins && !needFills && myCoins.has(mint)) continue;
+          const curve = state.curves.get(mint);
+          if (curve === undefined || curve.complete) continue;
+          if (Number(curve.real_quote_reserves) / LAMPORTS < minRq * 1.5) continue;
+          if (free < P.probeSol + 2 * tx) break;
+          orders.push({
+            side: 'buy',
+            mint,
+            quote_lamports: BigInt(Math.floor(P.probeSol * LAMPORTS)),
+            max_slippage_bps: P.buySlipBps,
+          });
+          probes.set(mint, false);
+          free -= P.probeSol + tx;
+        }
+      }
     }
     return orders;
   },
